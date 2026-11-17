@@ -182,7 +182,9 @@ def main():
         best = single.loc[single.groupby("fold")["dev_bal_acc"].idxmax()]
         summ = {"encoder": name, "probe": tag,
                 "best_layer_per_fold": best["layer"].tolist(),
-                "best_layer_mean_dev": int(per_layer["dev_bal_acc"].idxmax())}
+                "best_layer_mean_dev": int(per_layer["dev_bal_acc"].idxmax()),
+                "dev_bal_acc": round(float(per_layer["dev_bal_acc"].max()), 4)}
+        summ["select_score"] = summ["dev_bal_acc"]  # dev only: used by run_all.sh to rank encoders
         for m in ("bal_acc", "macro_f1", "auc", "eer", "spk_acc", "el_recall"):
             v = best[f"test_{m}"].astype(float)
             summ[f"test_{m}"] = f"{v.mean():.4f} ± {v.std(ddof=0):.4f}"
@@ -191,6 +193,9 @@ def main():
             for m in ("bal_acc", "auc", "el_recall"):
                 v = wt[f"test_{m}"].astype(float)
                 summ[f"weighted_test_{m}"] = f"{v.mean():.4f} ± {v.std(ddof=0):.4f}"
+            if len(wt):
+                summ["weighted_dev_bal_acc"] = round(float(wt["dev_bal_acc"].astype(float).mean()), 4)
+                summ["select_score"] = max(summ["select_score"], summ["weighted_dev_bal_acc"])
         (out / f"summary_{tag}.json").write_text(json.dumps(summ, indent=2))
         log.info("Summary: %s", json.dumps(summ, indent=2))
         overall.append(summ)

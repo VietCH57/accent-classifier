@@ -38,7 +38,19 @@ Encoders (`--encoder`): `xlsr300m`, `wavlm_large`, `hubert_large`, `wav2vec2_lar
 `phonrec:<checkpoint file|dir>` (our phoneme-recognition checkpoints; the XLS-R weights are found in
 the state dict whatever the key prefix).
 
-## Commands
+## One command: everything
+
+```bash
+nohup bash scripts/run_all.sh > run_all.out 2>&1 &
+tail -f logs/run_all.log
+```
+Steps: env check → L2-ARCTIC download (if missing) → metadata → 16 kHz cache → features of **every**
+encoder → probes of every encoder (with / without eLearning) → rank on dev → 4-fold training
+(one encoder after another in dev rank order, top-1 first; `TOP_K=n` limits it; `ABLATIONS=1` adds no-eLearning and mean+std runs) →
+`results/final_summary.md`. Resumable: re-running skips finished parts. Paths and options are
+environment variables at the top of the script (`ENCODERS`, `PHONREC`, `TOP_K`, `GPU_FRAC`, ...).
+
+## Commands (step by step)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
