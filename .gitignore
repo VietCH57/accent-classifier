@@ -22,3 +22,6 @@ nohup.out
 *.safetensors
 *.npy
 *.npz
+results/
+pretrained/
+data16k/

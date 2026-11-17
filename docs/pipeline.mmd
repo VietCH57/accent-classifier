@@ -1,0 +1,55 @@
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Helvetica, Arial, sans-serif','fontSize':'15px','primaryColor':'#eef2f7','primaryBorderColor':'#5b6b82','lineColor':'#5b6b82','clusterBkg':'#fafbfc','clusterBorder':'#c3cad5'}}}%%
+flowchart TB
+  subgraph P0["0 · Data  (build_metadata.py → prepare_audio.py)"]
+    direction LR
+    L2["L2-ARCTIC v5.0 full<br/>24 spk · 26,867 utt · 27 h · 44.1 kHz<br/>VN = HQTV PNV THV TLV"]
+    EL["eLearning (el_easy)<br/>373 utt · 3.7 h · 16 kHz<br/>all Vietnamese"]
+    META["metadata/<br/>utterances.csv · speakers.csv<br/>summary.md"]
+    FOLD["4-fold speaker CV (L2-ARCTIC)<br/>fold k: test = 6 spk (1 per L1, 3M/3F)<br/>dev = fold k+1 · train = other 12<br/>eLearning: official train/dev/test"]
+    R16["16 kHz mono WAV cache<br/>(column audio16k)"]
+    L2 --> META
+    EL --> META
+    META --> FOLD --> R16
+  end
+
+  subgraph PA["A · Encoder screening  (extract_features.py → probe.py)"]
+    direction LR
+    SEGA["fixed 4 s segments<br/>(all utterances)"]
+    ENCA["frozen encoder<br/>XLS-R · WavLM · HuBERT<br/>Whisper enc · phonrec · ECAPA"]
+    POOLA["mean + std per layer<br/>feats.npy [N, L, 2D] fp16"]
+    PROBE["probe per fold<br/>logistic / MLP per layer<br/>+ learned layer mix"]
+    PICK["pick encoder & layers<br/>(dev bal. acc)"]
+    SEGA --> ENCA --> POOLA --> PROBE --> PICK
+  end
+
+  subgraph PB["B · Train head  (train.py · run_cv.sh)"]
+    direction LR
+    SAMP["balanced sampler (train only)<br/>non-VN 50% · VN-L2A 25% · VN-eL 25%<br/>random crop 3–6 s"]
+    AUG["channel aug (GPU)<br/>band-limit · noise 5–30 dB · gain"]
+    ENCB["frozen encoder<br/>all hidden states [B, L, T, D]"]
+    HEAD["softmax layer weights → LN + Linear 256<br/>→ attentive stats pooling<br/>→ MLP → 2 logits"]
+    LOSS["cross-entropy"]
+    SAMP --> AUG --> ENCB --> HEAD --> LOSS
+  end
+
+  subgraph PE["Evaluation  (dev for selection · test once)"]
+    direction LR
+    SEGE["dev/test complete<br/>4 s segments"]
+    AGG["mean P(VN) per utterance<br/>→ per speaker"]
+    MET["L2-ARCTIC: bal. acc · macro-F1 · AUC · EER<br/>speaker acc · acc per L1<br/>eLearning: VN recall<br/>mean ± std over 4 folds (summarize.py)"]
+    SEGE --> AGG --> MET
+  end
+
+  R16 --> SEGA
+  R16 --> SAMP
+  PICK -. "chosen encoder" .-> ENCB
+  HEAD --> SEGE
+
+  classDef data fill:#e8f1fb,stroke:#3d6fa8,color:#1b2a3a
+  classDef frozen fill:#eceff3,stroke:#6b7686,color:#1b2a3a,stroke-dasharray:4 3
+  classDef train fill:#fdf0e3,stroke:#c07a2c,color:#3a2410
+  classDef evalc fill:#e9f6ee,stroke:#3c8d5a,color:#16301f
+  class L2,EL,META,FOLD,R16,SEGA,POOLA data
+  class ENCA,ENCB frozen
+  class PROBE,PICK,SAMP,AUG,HEAD,LOSS train
+  class SEGE,AGG,MET evalc

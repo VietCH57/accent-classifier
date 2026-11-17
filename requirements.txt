@@ -1,5 +1,14 @@
+# torch: install the CUDA build that matches the server first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.1
+transformers>=4.40
+safetensors
 numpy
 pandas
+scipy
+scikit-learn
 soundfile
 openpyxl
 tabulate
+# optional, only for --encoder ecapa:
+# speechbrain

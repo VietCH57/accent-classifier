@@ -248,7 +248,8 @@ def main(argv=None) -> None:
         d.mkdir(parents=True, exist_ok=True)
         parts = {}
         for s in SPLITS:
-            l2s = df[(df["corpus"] == "l2arctic") & (df["fold"].map(lambda f: split_of(f, k)) == s)]
+            l2 = df[df["corpus"] == "l2arctic"]
+            l2s = l2[l2["fold"].astype(int).map(lambda f: split_of(f, k)) == s]
             els = df[(df["corpus"] == "elearning") & (df["el_split"] == s)]
             parts[s] = pd.concat([l2s, els])
             parts[s][cols].to_csv(d / f"{s}.csv", index=False)
