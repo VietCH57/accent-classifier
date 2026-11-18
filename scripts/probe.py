@@ -60,35 +60,44 @@ class Probe(nn.Module):
         return self.net(x.float())
 
 
-def fit_predict(x: torch.Tensor, idx: dict, w: torch.Tensor, y: torch.Tensor, a, num_layers=1):
-    """x: [N, F] or [N, L, F] (already standardised, on device). Returns P(vn) for every row and the model."""
+def fit_predict(get, n: int, dim: int, idx: dict, w: torch.Tensor, y: torch.Tensor, a, num_layers=1):
+    """get(rows: LongTensor on CPU) -> standardised features of those rows on the device, [B, F] or [B, L, F].
+    Only one mini-batch is on the GPU at a time. Returns P(vn) for all n rows and the model."""
+    dev = w.device
     torch.manual_seed(a.seed)
-    model = Probe(x.shape[-1], num_layers, a.hidden if a.probe == "mlp" else 0).to(x.device)
+    model = Probe(dim, num_layers, a.hidden if a.probe == "mlp" else 0).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
-    tr = torch.as_tensor(idx["train"], device=x.device)
-    gen = torch.Generator(device="cpu").manual_seed(a.seed)
+    tr = torch.as_tensor(idx["train"])
+    gen = torch.Generator().manual_seed(a.seed)
     for _ in range(a.epochs):
-        perm = tr[torch.randperm(len(tr), generator=gen).to(x.device)]
-        for b in perm.split(a.batch_size):
-            loss = (F.cross_entropy(model(x[b]), y[b], reduction="none") * w[b]).sum() / w[b].sum()
+        for b in tr[torch.randperm(len(tr), generator=gen)].split(a.batch_size):
+            bd = b.to(dev)
+            loss = (F.cross_entropy(model(get(b)), y[bd], reduction="none") * w[bd]).sum() / w[bd].sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
     model.eval()
     with torch.no_grad():
-        prob = torch.cat([F.softmax(model(x[b]), -1)[:, 1] for b in torch.arange(len(x), device=x.device).split(8192)])
+        prob = torch.cat([F.softmax(model(get(b)), -1)[:, 1] for b in torch.arange(n).split(a.eval_batch)])
     return prob.cpu().numpy(), model
+
+
+def train_stats(x: torch.Tensor, rows: np.ndarray, dev, chunk: int = 2048):
+    """Mean / std over the train rows of a CPU tensor [N, ...], computed chunk-wise on the device."""
+    s = s2 = None
+    for b in torch.as_tensor(rows).split(chunk):
+        t = x[b].to(dev).double()
+        s = t.sum(0) if s is None else s + t.sum(0)
+        s2 = (t * t).sum(0) if s2 is None else s2 + (t * t).sum(0)
+    n = len(rows)
+    mean = s / n
+    std = (s2 / n - mean * mean).clamp(min=0).sqrt().clamp(min=1e-4)
+    return mean.float(), std.float()
 
 
 def evaluate(segs, prob, rows) -> dict:
     utt = metrics.aggregate_segments(segs.iloc[rows], prob[rows])
     return metrics.compute(utt)
-
-
-def standardise(x: torch.Tensor, train_idx: np.ndarray) -> torch.Tensor:
-    t = x[torch.as_tensor(train_idx, device=x.device)].float()
-    mean, std = t.mean(0), t.std(0).clamp(min=1e-4)
-    return ((x.float() - mean) / std).to(x.dtype)
 
 
 def main():
@@ -105,6 +114,7 @@ def main():
     p.add_argument("--shares", default="non_vietnamese:0.5,vn_l2arctic:0.25,vn_elearning:0.25")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--eval_batch", type=int, default=2048, help="rows per prediction batch (lower = less VRAM)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--seed", type=int, default=0)
@@ -138,10 +148,12 @@ def main():
                 group_weights(segs.iloc[idx["train"]], shares), device=device, dtype=torch.float)
             weights[k] = w
         for layer in layers:
-            x_raw = torch.from_numpy(np.ascontiguousarray(feats[:, layer])).to(device)
+            x_layer = torch.from_numpy(np.ascontiguousarray(feats[:, layer]))  # CPU [N, F] fp16
             for k in a.folds:
                 idx = splits[k]
-                prob, _ = fit_predict(standardise(x_raw, idx["train"]), idx, weights[k], y, a)
+                mean, std = train_stats(x_layer, idx["train"], device)
+                prob, _ = fit_predict(lambda b: (x_layer[b].to(device).float() - mean) / std, len(segs),
+                                      x_layer.shape[1], idx, weights[k], y, a)
                 r = {"fold": k, "layer": layer}
                 for s in ("dev", "test"):
                     r.update({f"{s}_{m}": v for m, v in metrics.headline(evaluate(segs, prob, idx[s])).items()})
@@ -149,15 +161,13 @@ def main():
                 log.info("layer %2d fold %d | dev bal_acc %.4f auc %.4f | test bal_acc %.4f auc %.4f el_rec %s",
                          layer, k, r["dev_bal_acc"], r["dev_auc"], r["test_bal_acc"], r["test_auc"],
                          f"{r['test_el_recall']:.3f}" if r["test_el_recall"] is not None else "-")
-            del x_raw
-        cache_all = None
         if a.weighted and L > 1:
-            cache_all = torch.from_numpy(np.asarray(feats)).to(device)  # [N, L, F] fp16
+            x_all = torch.from_numpy(np.ascontiguousarray(feats))  # CPU [N, L, F] fp16 (RAM, not VRAM)
             for k in a.folds:
                 idx = splits[k]
-                x = torch.stack([standardise(cache_all[:, l], idx["train"]) for l in range(L)], 1)
-                prob, model = fit_predict(x, idx, weights[k], y, a, num_layers=L)
-                del x
+                mean, std = train_stats(x_all, idx["train"], device)  # [L, F]
+                prob, model = fit_predict(lambda b: (x_all[b].to(device).float() - mean) / std, len(segs),
+                                          x_all.shape[2], idx, weights[k], y, a, num_layers=L)
                 lw = F.softmax(model.layer_logits.detach(), 0).cpu().numpy()
                 r = {"fold": k, "layer": "weighted", "layer_weights": json.dumps([round(float(v), 4) for v in lw])}
                 for s in ("dev", "test"):
@@ -169,7 +179,6 @@ def main():
                 rows.append(r)
                 log.info("weighted fold %d | dev bal_acc %.4f | test bal_acc %.4f auc %.4f | top layers %s", k,
                          r["dev_bal_acc"], r["test_bal_acc"], r["test_auc"], [int(i) for i in np.argsort(-lw)[:5]])
-        del cache_all
         torch.cuda.empty_cache() if device.type == "cuda" else None
         df = pd.DataFrame(rows)
         df.to_csv(out / f"probe_{tag}.csv", index=False)

@@ -50,6 +50,7 @@ PROBE_ARGS=${PROBE_ARGS:-}
 NO_EL_SHARES="non_vietnamese:0.5,vn_l2arctic:0.5"
 
 mkdir -p logs results
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 exec > >(tee -a logs/run_all.log) 2>&1
 step() { echo; echo "=================== [$(date '+%F %T')] $* ==================="; }
 die() { echo "FATAL: $*"; exit 1; }
@@ -157,6 +158,7 @@ for s, name, spec in rows:
     print(f"{name}={spec}={s}")
 EOF
 )
+[ -n "$RANKED" ] || die "no probe results to rank (step 5 failed?); fix it and re-run, finished steps are skipped"
 echo "$RANKED" | awk -F= '{printf "  %-16s dev bal_acc %s\n", $1, $NF}'
 if [ "$TOP_K" -gt 0 ]; then TOP=($(echo "$RANKED" | head -n "$TOP_K" | awk -F= '{print $1"="$2}'))
 else TOP=($(echo "$RANKED" | awk -F= '{print $1"="$2}')); fi
@@ -175,12 +177,14 @@ write_summary() {
 
 run_cv() {  # run_cv <run name> <encoder spec> [train args...]
   local run=$1 spec=$2; shift 2
+  local mem=()
+  case "$spec" in whisper*) mem=(--encoder_chunk 8 --eval_batch_seconds 100) ;; esac  # 30 s padding -> big activations
   for k in 0 1 2 3; do
     if [ -f "runs/$run/fold$k/metrics.json" ]; then echo "[$run] fold $k done"; continue; fi
     rm -f "runs/$run/fold$k/train.log"
     step "6. train $run fold $k"
     $PY scripts/train.py --encoder "$spec" --fold "$k" --run "$run" --metadata "$METADATA" --device "$DEVICE" \
-        --gpu_memory_fraction "$GPU_FRAC" --num_workers "$WORKERS" "$@" $TRAIN_ARGS \
+        --gpu_memory_fraction "$GPU_FRAC" --num_workers "$WORKERS" "${mem[@]}" "$@" $TRAIN_ARGS \
       || { echo "!! $run fold $k failed"; FAILED+=("$run fold $k"); }
   done
 }

@@ -89,7 +89,7 @@ class WhisperEncoder(nn.Module):
         out = self.model(feats.to(p.device, p.dtype), output_hidden_states=True)
         frames = torch.div(lengths + 319, 320, rounding_mode="floor").clamp(min=1)
         t = int(frames.max())
-        hs = torch.stack(out.hidden_states, dim=1)[:, :, :t]
+        hs = torch.stack([h[:, :t] for h in out.hidden_states], dim=1)  # drop the 30 s padding first
         return hs, lengths_to_mask(frames.to(hs.device), t)
 
 

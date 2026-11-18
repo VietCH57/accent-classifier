@@ -76,7 +76,10 @@ def parse():
     g.add_argument("--runs_root", default="runs")
     g.add_argument("--eval_every", type=int, default=500)
     g.add_argument("--log_every", type=int, default=50)
-    g.add_argument("--eval_batch_seconds", type=float, default=200.0)
+    g.add_argument("--eval_batch_seconds", type=float, default=200.0, help="lower = less VRAM at evaluation")
+    g.add_argument("--encoder_chunk", type=int, default=0,
+                   help="run the frozen encoder on at most this many crops at a time (0 = whole batch); "
+                        "same results, less VRAM")
     g.add_argument("--num_workers", type=int, default=6)
     g.add_argument("--device", default="cuda")
     g.add_argument("--gpu_memory_fraction", type=float, default=0.5)
@@ -93,6 +96,18 @@ def subsample_dev(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
 
 
 @torch.no_grad()
+def encode(enc, wav, lengths, chunk: int):
+    """Frozen encoder forward, optionally in chunks of `chunk` rows to cap peak VRAM."""
+    if chunk <= 0 or wav.shape[0] <= chunk:
+        return enc(wav, lengths)
+    parts = [enc(w, n) for w, n in zip(wav.split(chunk), lengths.split(chunk))]
+    t = max(h.shape[2] for h, _ in parts)
+    hs = torch.cat([F.pad(h, (0, 0, 0, t - h.shape[2])) for h, _ in parts])
+    mask = torch.cat([F.pad(m, (0, t - m.shape[1])) for _, m in parts])
+    return hs, mask
+
+
+@torch.no_grad()
 def predict(enc, head, df, a, device, use_bf16) -> pd.DataFrame:
     head.eval()
     segs = make_segments(df, a.eval_seg, a.eval_min_seg)
@@ -102,7 +117,7 @@ def predict(enc, head, df, a, device, use_bf16) -> pd.DataFrame:
     for idx, wav, lengths in loader:
         wav, lengths = wav.to(device, non_blocking=True), lengths.to(device)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
-            hs, mask = enc(wav, lengths)
+            hs, mask = encode(enc, wav, lengths, a.encoder_chunk)
             logits = head(hs, mask)
         prob[idx.numpy()] = F.softmax(logits.float(), -1)[:, 1].cpu().numpy()
     head.train()
@@ -159,8 +174,7 @@ def main():
         if aug is not None:
             wav = aug(wav, lengths)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
-            with torch.no_grad():
-                hs, mask = enc(wav, lengths)
+            hs, mask = encode(enc, wav, lengths, a.encoder_chunk)
             logits = head(hs, mask)
         loss = F.cross_entropy(logits.float(), y, label_smoothing=a.label_smoothing)
         opt.zero_grad(set_to_none=True)
