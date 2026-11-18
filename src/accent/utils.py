@@ -39,6 +39,7 @@ def setup_device(name: str, memory_fraction: float | None):
             torch.cuda.set_per_process_memory_fraction(float(memory_fraction), index)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.cufft_plan_cache[index].max_size = 16  # each cached plan holds GPU workspace
     return device
 
 

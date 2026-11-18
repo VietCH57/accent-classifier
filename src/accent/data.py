@@ -8,6 +8,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
 
 from . import audio
@@ -120,6 +121,29 @@ def collate_train(items):
 
 
 # --------------------------------------------------------------------------- augmentation
+FFT_BLOCK = 4096  # FFT lengths are rounded up to a multiple of this: few distinct cuFFT plans, cheap sizes
+
+
+def _filter(x: torch.Tensor, gain_fn) -> torch.Tensor:
+    """Multiply the spectrum of every row by gain_fn(freqs [F]) -> [B, F] or [F], via a zero-padded FFT.
+    Falls back to the CPU if cuFFT fails (it can when the GPU is nearly full)."""
+    n = x.shape[1]
+    m = -(-n // FFT_BLOCK) * FFT_BLOCK
+
+    def run(t):
+        spec = torch.fft.rfft(F.pad(t, (0, m - n)), dim=1)
+        g = gain_fn(torch.fft.rfftfreq(m, 1 / SR).to(t.device))
+        return torch.fft.irfft(spec * g.to(t.device), n=m, dim=1)[:, :n]
+
+    try:
+        return run(x)
+    except RuntimeError as e:
+        if "cuFFT" not in str(e) and "CUFFT" not in str(e):
+            raise
+        torch.backends.cuda.cufft_plan_cache.clear()
+        return run(x.cpu()).to(x.device)
+
+
 class Augment:
     """Channel augmentation applied on the GPU to break the corpus/channel shortcut:
     random band-limiting (telephone-like to wideband), additive noise at a random SNR, random gain.
@@ -135,22 +159,22 @@ class Augment:
         dev = wav.device
         mask = (torch.arange(n, device=dev)[None] < lengths[:, None].to(dev)).float()
         if self.p_band > 0:
-            spec = torch.fft.rfft(wav, dim=1)
-            freqs = torch.fft.rfftfreq(n, 1 / SR).to(dev)
             lo = torch.empty(b, device=dev).uniform_(*self.low_cut)
             hi = torch.empty(b, device=dev).uniform_(*self.high_cut)
-            keep = (freqs[None] >= lo[:, None]) & (freqs[None] <= hi[:, None])
             on = torch.rand(b, device=dev) < self.p_band
-            keep = keep | ~on[:, None]
-            wav = torch.fft.irfft(spec * keep, n=n, dim=1)
+
+            def band(freqs):
+                lo_, hi_, on_ = lo.to(freqs.device), hi.to(freqs.device), on.to(freqs.device)
+                keep = (freqs[None] >= lo_[:, None]) & (freqs[None] <= hi_[:, None])
+                return (keep | ~on_[:, None]).float()
+
+            wav = _filter(wav, band)
         if self.p_noise > 0:
             power = (wav**2 * mask).sum(1) / mask.sum(1).clamp(min=1)
             snr = torch.empty(b, device=dev).uniform_(*self.snr)
             noise = torch.randn_like(wav)
             if torch.rand(()) < 0.5:  # pinkish noise half of the time
-                spec = torch.fft.rfft(noise, dim=1)
-                f = torch.fft.rfftfreq(n, 1 / SR).to(dev).clamp(min=20)
-                noise = torch.fft.irfft(spec / f.sqrt(), n=n, dim=1)
+                noise = _filter(noise, lambda f: 1 / f.clamp(min=20).sqrt())
                 noise = noise / noise.std(dim=1, keepdim=True).clamp(min=1e-8)
             scale = torch.sqrt(power / (10 ** (snr / 10)))
             on = (torch.rand(b, device=dev) < self.p_noise).float()
