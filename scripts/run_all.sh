@@ -41,7 +41,8 @@ FEATURES=${FEATURES:-features}
 ENCODERS=${ENCODERS:-"xlsr300m wavlm_large hubert_large wav2vec2_large whisper_small whisper_medium ecapa"}
 PHONREC=${PHONREC:-}                       # optional "name=/path/to/checkpoint ..." (reported, not selected: leakage)
 TOP_K=${TOP_K:-0}                          # 0 = train every ranked encoder in rank order; n = only the top n
-ABLATIONS=${ABLATIONS:-0}                  # 1 = also train the two ablations of step 7
+ABLATIONS=${ABLATIONS:-0}
+LAYER_MODE=${LAYER_MODE:-best}             # best = the encoder's best probe layer on dev (fixed); weighted = learned mix                  # 1 = also train the two ablations of step 7
 DEVICE=${DEVICE:-cuda}
 GPU_FRAC=${GPU_FRAC:-0.5}
 WORKERS=${WORKERS:-6}
@@ -152,24 +153,26 @@ for c in sys.argv[1:]:
     name, spec = c.split("=", 1)
     f = Path("results/probe") / name / "summary_linear.json"
     if f.exists():
-        rows.append((json.loads(f.read_text())["select_score"], name, spec))
+        j = json.loads(f.read_text())
+        # single-layer probe (dev): the learned layer mix latched onto low, channel-heavy layers
+        rows.append((j["dev_bal_acc"], name, spec, j["best_layer_mean_dev"]))
 rows.sort(reverse=True)
-for s, name, spec in rows:
-    print(f"{name}={spec}={s}")
+for s, name, spec, layer in rows:
+    print(f"{name}={spec}={layer}={s}")
 EOF
 )
 [ -n "$RANKED" ] || die "no probe results to rank (step 5 failed?); fix it and re-run, finished steps are skipped"
-echo "$RANKED" | awk -F= '{printf "  %-16s dev bal_acc %s\n", $1, $NF}'
-if [ "$TOP_K" -gt 0 ]; then TOP=($(echo "$RANKED" | head -n "$TOP_K" | awk -F= '{print $1"="$2}'))
-else TOP=($(echo "$RANKED" | awk -F= '{print $1"="$2}')); fi
+echo "$RANKED" | awk -F= '{printf "  %-16s layer %-3s dev bal_acc %s\n", $1, $3, $NF}'
+if [ "$TOP_K" -gt 0 ]; then TOP=($(echo "$RANKED" | head -n "$TOP_K" | awk -F= '{print $1"="$2"="$3}'))
+else TOP=($(echo "$RANKED" | awk -F= '{print $1"="$2"="$3}')); fi
 [ ${#TOP[@]} -gt 0 ] || die "no ranked encoders"
 echo "training order: ${TOP[*]}"
 
 write_summary() {
   {
     echo "# Accent classifier: final summary ($(date '+%F %T'))"
-    echo; echo "Encoder ranking on dev (probe, best of single layer / weighted):"; echo
-    echo "$RANKED" | awk -F= '{printf "%d. %s: %s\n", NR, $1, $NF}'
+    echo; echo "Encoder ranking on dev (single-layer linear probe):"; echo
+    echo "$RANKED" | awk -F= '{printf "%d. %s (layer %s): %s\n", NR, $1, $3, $NF}'
     echo; $PY scripts/summarize.py --split test
     echo; $PY scripts/summarize.py --split dev | sed -n '/Trained heads/,/Accuracy per L1/p' | sed '$d'
   } > results/final_summary.md
@@ -188,11 +191,19 @@ run_cv() {  # run_cv <run name> <encoder spec> [train args...]
       || { echo "!! $run fold $k failed"; FAILED+=("$run fold $k"); }
   done
 }
+# TOP entries: name=spec=layer
+t_name() { echo "${1%%=*}"; }
+t_spec() { local r=${1#*=}; echo "${r%=*}"; }
+t_layer() { echo "${1##*=}"; }
+t_run() {  # run name + layer args for one TOP entry
+  if [ "$LAYER_MODE" = weighted ]; then echo "$(t_name "$1")_asp"; else echo "$(t_name "$1")_L$(t_layer "$1")_asp"; fi
+}
+t_layer_args() { [ "$LAYER_MODE" = weighted ] || echo "--layer $(t_layer "$1")"; }
 rank=0
 for t in "${TOP[@]}"; do
   rank=$((rank + 1))
-  step "6. top-$rank / ${#TOP[@]}: ${t%%=*}"
-  run_cv "${t%%=*}_asp" "${t#*=}"
+  step "6. top-$rank / ${#TOP[@]}: $(t_name "$t") (layer: $([ "$LAYER_MODE" = weighted ] && echo learned mix || t_layer "$t"))"
+  run_cv "$(t_run "$t")" "$(t_spec "$t")" $(t_layer_args "$t")
   write_summary
   echo "summary updated after top-$rank (results/final_summary.md)"
 done
@@ -200,9 +211,9 @@ done
 # ------------------------------------------------------------------------------------- 7
 best=${TOP[0]}
 if [ "$ABLATIONS" = 1 ]; then
-  step "7. ablations on the best encoder (${best%%=*})"
-  run_cv "${best%%=*}_asp_noel" "${best#*=}" --train_corpora l2arctic --shares "$NO_EL_SHARES"
-  run_cv "${best%%=*}_meanstd" "${best#*=}" --pool meanstd
+  step "7. ablations on the best encoder ($(t_name "$best"))"
+  run_cv "$(t_run "$best")_noel" "$(t_spec "$best")" $(t_layer_args "$best") --train_corpora l2arctic --shares "$NO_EL_SHARES"
+  run_cv "$(t_run "$best" | sed 's/_asp$//')_meanstd" "$(t_spec "$best")" $(t_layer_args "$best") --pool meanstd
 else
   echo "step 7 skipped (ABLATIONS=0)"
 fi
